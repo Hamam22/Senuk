@@ -9,7 +9,6 @@ from functools import partial
 from zoneinfo import ZoneInfo
 
 import httpx
-
 from ..code.encrypt import CipherHandler
 
 
@@ -29,421 +28,285 @@ class DataBase:
 
         if self.storage_type == "mongo":
             import pymongo
-
             self.mongo_url = options.get("mongo_url")
             if not self.mongo_url:
-                raise ValueError("mongo_url is required for MongoDB storage")
-
+                raise ValueError("mongo_url is required")
             self.client = pymongo.MongoClient(self.mongo_url)
             self.data = self.client[self.file_name]
 
         elif self.storage_type == "sqlite":
             self.db_file = f"{self.file_name}.db"
             self.conn = sqlite3.connect(self.db_file, check_same_thread=False)
-            self._initialize_sqlite()
+            self._init_sqlite()
 
         else:
             self.data_file = f"{self.file_name}.json"
             if not os.path.exists(self.data_file):
-                self._sync_save_data({"vars": {}, "bots": []})
+                self._sync_save({"vars": {}, "bots": []})
 
         self._register_backup_task()
 
-    async def _run_sync(self, func, *args, **kwargs):
+    async def _run_sync(self, func, *a, **kw):
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, partial(func, *args, **kwargs))
+        return await loop.run_in_executor(None, partial(func, *a, **kw))
+
+    def _safe_json(self, value):
+        if isinstance(value, (dict, list)):
+            return value
+        if not isinstance(value, str):
+            return value
+        try:
+            return json.loads(value)
+        except Exception:
+            return value
+
+    def _safe_decrypt(self, value):
+        try:
+            decrypted = self.cipher.decrypt(value)
+        except Exception:
+            return value
+        return self._safe_json(decrypted)
 
     def _register_backup_task(self):
-        if self.auto_backup and self.scheduler and self.storage_type in ["local", "sqlite"]:
+        if not (self.auto_backup and self.scheduler):
+            return
+        if not self.backup_bot_token or not self.backup_chat_id:
+            return
 
-            if not self.backup_bot_token or not self.backup_chat_id:
-                return self.cipher.log.warning("Auto backup is disabled because token/chat_id is missing.")
-
-            @self.scheduler.cron(self.backup_cron_spec)
-            async def scheduled_backup_task():
-                self.cipher.log.info("Starting scheduled backup process...")
-                await self.perform_backup()
+        @self.scheduler.cron(self.backup_cron_spec)
+        async def _job():
+            await self.perform_backup()
 
     async def perform_backup(self):
-        source_paths = []
-
         db_path = self.data_file if self.storage_type == "local" else self.db_file
-        if await self._run_sync(os.path.exists, db_path):
-            source_paths.append(db_path)
-        else:
-            self.cipher.log.warning("Database file not found. Skipping database backup.")
+        if not await self._run_sync(os.path.exists, db_path):
+            return
 
-        env_files = await self._run_sync(glob.glob, "*.env")
-        if env_files:
-            source_paths.extend(env_files)
+        zip_name = f"backup_{self.file_name}_{datetime.now(ZoneInfo('Asia/Jakarta')).strftime('%Y%m%d_%H%M%S')}.zip"
 
-        if not source_paths:
-            return self.cipher.log.warning("No files to back up. Aborting.")
-
-        zip_path = None
+        with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as z:
+            z.write(db_path, os.path.basename(db_path))
 
         try:
-            zip_path = await self._run_sync(self._create_zip_archive, source_paths)
-            if zip_path:
-                timestamp = datetime.now(ZoneInfo("Asia/Jakarta")).strftime("%Y-%m-%d %H:%M:%S %Z")
+            await self._send_zip(zip_name)
+        finally:
+            if os.path.exists(zip_name):
+                os.remove(zip_name)
 
-                caption = (
-                    f"Backup otomatis untuk `{os.path.basename(zip_path)}`\n"
-                    f"Tipe DB: `{self.storage_type}`\n"
-                    f"Waktu: `{timestamp}`",
+    async def _send_zip(self, path):
+        url = f"https://api.telegram.org/bot{self.backup_bot_token}/sendDocument"
+        async with httpx.AsyncClient(timeout=60) as client:
+            with open(path, "rb") as f:
+                await client.post(
+                    url,
+                    data={"chat_id": self.backup_chat_id},
+                    files={"document": f},
                 )
 
-                await self._send_zip_to_telegram(zip_path, caption)
-
-        finally:
-            if zip_path and await self._run_sync(os.path.exists, zip_path):
-                await self._run_sync(os.remove, zip_path)
-
-    def _create_zip_archive(self, source_paths: list):
-        timestamp = datetime.now(ZoneInfo("Asia/Jakarta")).strftime("%Y%m%d_%H%M%S")
-        zip_filename = f"backup_{self.file_name}_{timestamp}.zip"
-
-        try:
-            with zipfile.ZipFile(zip_filename, "w", zipfile.ZIP_DEFLATED) as zf:
-                for path in source_paths:
-                    zf.write(path, os.path.basename(path))
-
-            return zip_filename
-
-        except Exception as e:
-            self.cipher.log.error(f"Failed to create ZIP archive: {e}")
-            return None
-
-    async def _send_zip_to_telegram(self, file_path, caption):
-        url = f"https://api.telegram.org/bot{self.backup_bot_token}/sendDocument"
-
-        try:
-            with open(file_path, "rb") as doc:
-                files = {"document": doc}
-                params = {
-                    "chat_id": self.backup_chat_id,
-                    "caption": caption,
-                    "parse_mode": "Markdown",
-                }
-
-                async with httpx.AsyncClient(timeout=60) as client:
-                    response = await client.post(url, params=params, files=files)
-
-            response.raise_for_status()
-            response_data = response.json()
-
-            if response_data.get("ok"):
-                self.cipher.log.info("Successfully sent to Telegram.")
-            else:
-                self.cipher.log.error(f"Failed to send: {response_data.get('description')}")
-
-        except Exception as e:
-            self.cipher.log.error(f"Failed to send file to Telegram: {e}")
-
-    def _sync_load_data(self):
+    def _sync_load(self):
         try:
             with open(self.data_file, "r") as f:
                 return json.load(f)
-
-        except (json.JSONDecodeError, FileNotFoundError):
+        except Exception:
             return {"vars": {}, "bots": []}
 
-    def _sync_save_data(self, data):
+    def _sync_save(self, data):
         with open(self.data_file, "w") as f:
             json.dump(data, f, indent=4)
 
-    async def _load_data(self):
-        return await self._run_sync(self._sync_load_data)
+    async def _load(self):
+        return await self._run_sync(self._sync_load)
 
-    async def _save_data(self, data):
-        await self._run_sync(self._sync_save_data, data)
+    async def _save(self, data):
+        await self._run_sync(self._sync_save, data)
 
-    def __del__(self):
-        self.close()
-
-    async def close_async(self):
-        await self._run_sync(self.close)
-
-    def close(self):
-        if self.storage_type == "sqlite" and hasattr(self, "conn") and self.conn:
-            self.conn.close()
-
-    def _initialize_sqlite(self):
-        cursor = self.conn.cursor()
-
-        cursor.execute("CREATE TABLE IF NOT EXISTS vars (user_id TEXT PRIMARY KEY, data TEXT)")
-
-        cursor.execute(
+    def _init_sqlite(self):
+        c = self.conn.cursor()
+        c.execute("CREATE TABLE IF NOT EXISTS vars (user_id TEXT PRIMARY KEY, data TEXT)")
+        c.execute(
             "CREATE TABLE IF NOT EXISTS bots (user_id TEXT PRIMARY KEY, api_id TEXT, api_hash TEXT, bot_token TEXT, session_string TEXT)"
         )
-
         self.conn.commit()
 
     async def _get_user_vars(self, user_id):
-        user_id_str = str(user_id)
+        uid = str(user_id)
 
         if self.storage_type == "sqlite":
             row = await self._run_sync(
-                lambda: self.conn.cursor().execute("SELECT data FROM vars WHERE user_id = ?", (user_id_str,)).fetchone()
+                lambda: self.conn.cursor().execute(
+                    "SELECT data FROM vars WHERE user_id = ?", (uid,)
+                ).fetchone()
             )
+            if not row:
+                return {}
+            return self._safe_decrypt(row[0])
 
-            return json.loads(self.cipher.decrypt(row[0])) if row else {}
+        if self.storage_type == "mongo":
+            data = await self._run_sync(lambda: self.data.vars.find_one({"_id": uid}))
+            return data or {}
 
-        elif self.storage_type == "mongo":
-            data = await self._run_sync(lambda: self.data.vars.find_one({"_id": user_id_str}))
-
-            return data if data else {}
-
-        else:
-            data = await self._load_data()
-            return data.get("vars", {}).get(user_id_str, {})
+        data = await self._load()
+        return data.get("vars", {}).get(uid, {})
 
     async def _set_user_vars(self, user_id, user_data):
-        user_id_str = str(user_id)
+        uid = str(user_id)
 
         if self.storage_type == "sqlite":
-            encrypted_data = self.cipher.encrypt(json.dumps(user_data))
-
+            enc = self.cipher.encrypt(json.dumps(user_data))
             await self._run_sync(
                 lambda: (
                     self.conn.execute(
-                        "INSERT OR REPLACE INTO vars (user_id, data) VALUES (?, ?)", (user_id_str, encrypted_data)
+                        "INSERT OR REPLACE INTO vars (user_id, data) VALUES (?, ?)", (uid, enc)
                     ),
                     self.conn.commit(),
                 )
             )
+            return
 
-        elif self.storage_type == "mongo":
+        if self.storage_type == "mongo":
             await self._run_sync(
-                lambda: self.data.vars.update_one({"_id": user_id_str}, {"$set": user_data}, upsert=True)
+                lambda: self.data.vars.update_one({"_id": uid}, {"$set": user_data}, upsert=True)
             )
+            return
 
-        else:
-            full_data = await self._load_data()
-            full_data.setdefault("vars", {})[user_id_str] = user_data
-            await self._save_data(full_data)
+        data = await self._load()
+        data.setdefault("vars", {})[uid] = user_data
+        await self._save(data)
 
     async def setVars(self, user_id, query_name, value, var_key="variabel"):
-        encrypted_value = self.cipher.encrypt(json.dumps(value) if isinstance(value, (dict, list)) else str(value))
-
-        user_data = await self._get_user_vars(user_id)
-        user_data.setdefault(var_key, {})[query_name] = encrypted_value
-
-        await self._set_user_vars(user_id, user_data)
+        enc = self.cipher.encrypt(json.dumps(value) if isinstance(value, (dict, list)) else str(value))
+        data = await self._get_user_vars(user_id)
+        data.setdefault(var_key, {})[query_name] = enc
+        await self._set_user_vars(user_id, data)
 
     async def getVars(self, user_id, query_name, var_key="variabel"):
-        user_data = await self._get_user_vars(user_id)
-
-        encrypted_value = user_data.get(var_key, {}).get(query_name)
-        if not encrypted_value:
+        data = await self._get_user_vars(user_id)
+        val = data.get(var_key, {}).get(query_name)
+        if not val:
             return None
-
-        decrypted_str = self.cipher.decrypt(encrypted_value)
-
-        try:
-            return json.loads(decrypted_str)
-
-        except (json.JSONDecodeError, TypeError):
-            return decrypted_str
+        return self._safe_decrypt(val)
 
     async def removeVars(self, user_id, query_name, var_key="variabel"):
-        user_data = await self._get_user_vars(user_id)
-
-        if user_data.get(var_key, {}).pop(query_name, None):
-            await self._set_user_vars(user_id, user_data)
+        data = await self._get_user_vars(user_id)
+        if data.get(var_key, {}).pop(query_name, None):
+            await self._set_user_vars(user_id, data)
 
     async def setListVars(self, user_id, query_name, value, var_key="variabel"):
-        encrypted_value = self.cipher.encrypt(json.dumps(value) if isinstance(value, (dict, list)) else str(value))
-
-        user_data = await self._get_user_vars(user_id)
-
-        user_data.setdefault(var_key, {}).setdefault(query_name, [])
-
-        if encrypted_value not in user_data[var_key][query_name]:
-            user_data[var_key][query_name].append(encrypted_value)
-            await self._set_user_vars(user_id, user_data)
+        enc = self.cipher.encrypt(json.dumps(value) if isinstance(value, (dict, list)) else str(value))
+        data = await self._get_user_vars(user_id)
+        data.setdefault(var_key, {}).setdefault(query_name, [])
+        if enc not in data[var_key][query_name]:
+            data[var_key][query_name].append(enc)
+            await self._set_user_vars(user_id, data)
 
     async def getListVars(self, user_id, query_name, var_key="variabel"):
-        user_data = await self._get_user_vars(user_id)
-
-        encrypted_list = user_data.get(var_key, {}).get(query_name, [])
-
-        return [
-            json.loads(self.cipher.decrypt(v)) if v.startswith(("[", "{")) else self.cipher.decrypt(v)
-            for v in encrypted_list
-        ]
+        data = await self._get_user_vars(user_id)
+        return [self._safe_decrypt(v) for v in data.get(var_key, {}).get(query_name, [])]
 
     async def removeListVars(self, user_id, query_name, value, var_key="variabel"):
-        encrypted_value = self.cipher.encrypt(json.dumps(value) if isinstance(value, (dict, list)) else str(value))
-
-        user_data = await self._get_user_vars(user_id)
-
+        enc = self.cipher.encrypt(json.dumps(value) if isinstance(value, (dict, list)) else str(value))
+        data = await self._get_user_vars(user_id)
         try:
-            user_data.get(var_key, {}).get(query_name, []).remove(encrypted_value)
-            await self._set_user_vars(user_id, user_data)
-
-        except (ValueError, KeyError):
+            data.get(var_key, {}).get(query_name, []).remove(enc)
+            await self._set_user_vars(user_id, data)
+        except Exception:
             pass
 
-    async def removeAllVars(self, user_id):
-        user_id_str = str(user_id)
+    async def allVars(self, user_id, var_key="variabel"):
+        data = await self._get_user_vars(user_id)
+        out = {}
+        for k, v in data.get(var_key, {}).items():
+            if isinstance(v, list):
+                out[k] = [self._safe_decrypt(i) for i in v]
+            else:
+                out[k] = self._safe_decrypt(v)
+        return out
+
+    async def saveBot(self, user_id, api_id, api_hash, value, is_token=False):
+        uid = str(user_id)
+        field = "bot_token" if is_token else "session_string"
+        bot = {
+            "api_id": self.cipher.encrypt(str(api_id)),
+            "api_hash": self.cipher.encrypt(api_hash),
+        }
+        if value:
+            bot[field] = self.cipher.encrypt(value)
+
+        if self.storage_type == "mongo":
+            await self._run_sync(
+                lambda: self.data.bot.update_one({"_id": uid}, {"$set": bot}, upsert=True)
+            )
+            return
 
         if self.storage_type == "sqlite":
             await self._run_sync(
                 lambda: (
-                    self.conn.execute("DELETE FROM vars WHERE user_id = ?", (user_id_str,)),
-                    self.conn.commit(),
-                )
-            )
-
-        elif self.storage_type == "mongo":
-            await self._run_sync(lambda: self.data.vars.delete_one({"_id": user_id_str}))
-
-        else:
-            full_data = await self._load_data()
-            full_data.get("vars", {}).pop(user_id_str, None)
-            await self._save_data(full_data)
-
-    async def allVars(self, user_id, var_key="variabel"):
-        user_data = await self._get_user_vars(user_id)
-
-        encrypted_data = user_data.get(var_key, {})
-        decrypted = {}
-
-        for key, value in encrypted_data.items():
-
-            if isinstance(value, list):
-                temp_list = []
-
-                for v in value:
-                    decrypted_v_str = self.cipher.decrypt(v)
-
-                    try:
-                        temp_list.append(json.loads(decrypted_v_str))
-                    except (json.JSONDecodeError, TypeError):
-                        temp_list.append(decrypted_v_str)
-
-                decrypted[key] = temp_list
-
-            else:
-                decrypted_v_str = self.cipher.decrypt(value)
-
-                try:
-                    decrypted[key] = json.loads(decrypted_v_str)
-                except (json.JSONDecodeError, TypeError):
-                    decrypted[key] = decrypted_v_str
-
-        return decrypted
-
-    async def saveBot(self, user_id, api_id, api_hash, value, is_token=False):
-        user_id_str = str(user_id)
-
-        field = "bot_token" if is_token else "session_string"
-
-        bot_data = {"api_id": self.cipher.encrypt(str(api_id)), "api_hash": self.cipher.encrypt(api_hash)}
-
-        if value:
-            bot_data[field] = self.cipher.encrypt(value)
-
-        if self.storage_type == "mongo":
-            await self._run_sync(
-                lambda: self.data.bot.update_one(
-                    {"_id": user_id_str},
-                    {"$set": bot_data},
-                    upsert=True,
-                )
-            )
-
-        elif self.storage_type == "sqlite":
-            await self._run_sync(
-                lambda: (
                     self.conn.execute(
-                        "INSERT OR REPLACE INTO bots (user_id, api_id, api_hash, bot_token, session_string) VALUES (?, ?, ?, ?, ?)",
-                        (
-                            user_id_str,
-                            bot_data["api_id"],
-                            bot_data["api_hash"],
-                            bot_data.get("bot_token"),
-                            bot_data.get("session_string"),
-                        ),
+                        "INSERT OR REPLACE INTO bots VALUES (?, ?, ?, ?, ?)",
+                        (uid, bot["api_id"], bot["api_hash"], bot.get("bot_token"), bot.get("session_string")),
                     ),
                     self.conn.commit(),
                 )
             )
+            return
 
+        data = await self._load()
+        data.setdefault("bots", [])
+        found = next((b for b in data["bots"] if b.get("user_id") == uid), None)
+        if found:
+            found.update(bot)
         else:
-            data = await self._load_data()
-            existing = next((b for b in data["bots"] if b.get("user_id") == user_id_str), None)
-
-            if existing:
-                existing.update(bot_data)
-            else:
-                data.setdefault("bots", []).append({"user_id": user_id_str, **bot_data})
-
-            await self._save_data(data)
+            data["bots"].append({"user_id": uid, **bot})
+        await self._save(data)
 
     async def getBots(self, is_token=False):
-        raw_bots = []
+        raw = []
 
         if self.storage_type == "mongo":
-            raw_bots = await self._run_sync(lambda: list(self.data.bot.find()))
-
+            raw = await self._run_sync(lambda: list(self.data.bot.find()))
         elif self.storage_type == "sqlite":
             rows = await self._run_sync(
-                lambda: self.conn.cursor()
-                .execute("SELECT user_id, api_id, api_hash, bot_token, session_string FROM bots")
-                .fetchall()
+                lambda: self.conn.cursor().execute(
+                    "SELECT user_id, api_id, api_hash, bot_token, session_string FROM bots"
+                ).fetchall()
             )
-
-            raw_bots = [
-                {
-                    "user_id": r[0],
-                    "api_id": r[1],
-                    "api_hash": r[2],
-                    "bot_token": r[3],
-                    "session_string": r[4],
-                }
+            raw = [
+                dict(zip(["user_id", "api_id", "api_hash", "bot_token", "session_string"], r))
                 for r in rows
             ]
-
         else:
-            data = await self._load_data()
-            raw_bots = data.get("bots", [])
+            raw = (await self._load()).get("bots", [])
 
-        decrypted_bots = []
-
-        for bot_data in raw_bots:
+        out = []
+        for b in raw:
             try:
-                decrypted = {"name": bot_data.get("user_id") or bot_data.get("_id")}
-
-                for key in ["api_id", "api_hash", "bot_token", "session_string"]:
-                    if bot_data.get(key):
-                        value = self.cipher.decrypt(bot_data[key])
-                        decrypted[key] = int(value) if key == "api_id" else value
-
-                if (is_token and "bot_token" in decrypted) or (not is_token and "session_string" in decrypted):
-                    decrypted_bots.append(decrypted)
-
-            except (ValueError, TypeError):
+                d = {"name": b.get("user_id") or b.get("_id")}
+                for k in ["api_id", "api_hash", "bot_token", "session_string"]:
+                    if b.get(k):
+                        v = self.cipher.decrypt(b[k])
+                        d[k] = int(v) if k == "api_id" else v
+                if (is_token and "bot_token" in d) or (not is_token and "session_string" in d):
+                    out.append(d)
+            except Exception:
                 continue
-
-        return decrypted_bots
+        return out
 
     async def removeBot(self, user_id):
-        user_id_str = str(user_id)
+        uid = str(user_id)
 
         if self.storage_type == "mongo":
-            await self._run_sync(lambda: self.data.bot.delete_one({"_id": user_id_str}))
+            await self._run_sync(lambda: self.data.bot.delete_one({"_id": uid}))
+            return
 
-        elif self.storage_type == "sqlite":
+        if self.storage_type == "sqlite":
             await self._run_sync(
                 lambda: (
-                    self.conn.execute("DELETE FROM bots WHERE user_id = ?", (user_id_str,)),
+                    self.conn.execute("DELETE FROM bots WHERE user_id = ?", (uid,)),
                     self.conn.commit(),
                 )
             )
+            return
 
-        else:
-            data = await self._load_data()
-            data["bots"] = [b for b in data["bots"] if b.get("user_id") != user_id_str]
-            await self._save_data(data)
+        data = await self._load()
+        data["bots"] = [b for b in data.get("bots", []) if b.get("user_id") != uid]
+        await self._save(data)
