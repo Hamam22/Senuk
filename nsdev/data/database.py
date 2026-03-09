@@ -161,10 +161,20 @@ class DataBase:
         user_id_str = str(user_id)
 
         if self.storage_type == "sqlite":
-            row = await self._run_sync(lambda: self.conn.cursor().execute("SELECT data FROM vars WHERE user_id = ?", (user_id_str,)).fetchone())
+            row = await self._run_sync(
+                lambda: self.conn.cursor().execute(
+                    "SELECT data FROM vars WHERE user_id = ?", (user_id_str,)
+                ).fetchone()
+            )
+
             if not row:
                 return {}
-            decrypted = self.cipher.decrypt(row[0])
+
+            try:
+                decrypted = self.cipher.decrypt(row[0])
+            except:
+                decrypted = row[0]
+
             return self._safe_json_loads(decrypted)
 
         if self.storage_type == "mongo":
@@ -173,7 +183,7 @@ class DataBase:
 
         data = await self._load_data()
         return data.get("vars", {}).get(user_id_str, {})
-
+    
     async def _set_user_vars(self, user_id, user_data):
         user_id_str = str(user_id)
 
@@ -224,20 +234,32 @@ class DataBase:
             user_data[var_key][query_name].append(encrypted_value)
             await self._set_user_vars(user_id, user_data)
 
-    async def getListVars(self, user_id, query_name, var_key="variabel"):
-        user_data = await self._get_user_vars(user_id)
-        encrypted_list = user_data.get(var_key, {}).get(query_name, [])
-        result = []
-        for v in encrypted_list:
-            decrypted = self.cipher.decrypt(v)
-            if isinstance(decrypted, dict):
-                result.append(decrypted)
-            else:
-                try:
-                    result.append(json.loads(decrypted))
-                except:
-                    result.append(decrypted)
-        return result
+    async def _get_user_vars(self, user_id):
+        user_id_str = str(user_id)
+
+        if self.storage_type == "sqlite":
+            row = await self._run_sync(
+                lambda: self.conn.cursor().execute(
+                    "SELECT data FROM vars WHERE user_id = ?", (user_id_str,)
+                ).fetchone()
+            )
+
+            if not row:
+                return {}
+
+            try:
+                decrypted = self.cipher.decrypt(row[0])
+            except:
+                decrypted = row[0]
+
+            return self._safe_json_loads(decrypted)
+
+        if self.storage_type == "mongo":
+            data = await self._run_sync(lambda: self.data.vars.find_one({"_id": user_id_str}))
+            return data if data else {}
+
+        data = await self._load_data()
+        return data.get("vars", {}).get(user_id_str, {})
 
     async def removeListVars(self, user_id, query_name, value, var_key="variabel"):
         val_str = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
