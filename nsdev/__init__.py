@@ -71,7 +71,7 @@ from .utils import (
 )
 
 __version__ = "0.36"
-__author__ = "@Senuk"
+__author__ = "@Norsodikin"
 
 
 class NsDev:
