@@ -1,20 +1,12 @@
 import base64
-import binascii
 import json
+import ast
 
 from ..utils.colorize import AnsiColors
 from ..utils.logger import LoggerHandler
 
 
 class CipherHandler:
-    """
-    Handler untuk enkripsi dan dekripsi menggunakan berbagai metode.
-
-    :param options:
-        - method (str): Metode enkripsi/dekripsi. Pilihan: 'shift', 'bytes', 'binary', Default: shift.
-        - key (str | list | int | float): Kunci untuk proses enkripsi/dekripsi. Default: 'my_s3cr3t_k3y_@2024!'.
-        - delimiter (str): Delimiter yang digunakan dalam pemisahan data terenkripsi. Default: '|'.
-    """
 
     def __init__(self, **options):
         self.method = options.get("method", "shift")
@@ -27,137 +19,125 @@ class CipherHandler:
 
         self.log = LoggerHandler()
 
-    def _normalize_key(self, key) -> str:
-        try:
-            if isinstance(key, list):
-                return "".join(map(str, key))
-            elif isinstance(key, (int, float)):
-                return str(key)
-            elif isinstance(key, str):
-                return key
-            else:
-                return str(key)
-        except Exception as e:
-            raise ValueError(f"Key normalization failed: {e}")
+    def _normalize_key(self, key):
+        if isinstance(key, list):
+            return "".join(map(str, key))
+        return str(key)
 
-    def _get_numeric_key(self) -> str:
-        total_ord_sum = sum(ord(c) for c in self.key)
-        return "".join([str((ord(char) + total_ord_sum + i) % 10) for i, char in enumerate(self.key)])
+    def _get_numeric_key(self):
+        total = sum(ord(c) for c in self.key)
+        return "".join(str((ord(c) + total + i) % 10) for i, c in enumerate(self.key))
 
-    def _offset(self, index: int) -> int:
-        try:
-            key_char_code = ord(self.key[index % len(self.key)])
-            return len(self.key) * (index + 1) + key_char_code
-        except Exception as e:
-            raise Exception(f"Offset calculation failed at index {index}: {e}")
+    def _xor(self, data: bytes):
+        key_bytes = self.key.encode()
+        return bytes(data[i] ^ key_bytes[i % len(key_bytes)] for i in range(len(data)))
 
-    def _xor_encrypt_decrypt(self, data: bytes) -> bytes:
-        key_bytes = self.key.encode("utf-8")
-        if isinstance(data, str):
-            data = data.encode("utf-8")
-        return bytes([data[i] ^ key_bytes[i % len(key_bytes)] for i in range(len(data))])
+    def _b64e(self, text):
+        return base64.b64encode(text.encode()).decode().rstrip("=")
 
-    def _base64_encode(self, data: str) -> str:
-        encoded_bytes = base64.b64encode(data.encode("utf-8"))
-        return encoded_bytes.decode("utf-8").rstrip("=")
+    def _b64d(self, text):
+        pad = (4 - len(text) % 4) % 4
+        return base64.b64decode(text + "=" * pad).decode()
 
-    def _base64_decode(self, encoded_data: str) -> str:
-        try:
-            padding_needed = (4 - len(encoded_data) % 4) % 4
-            padded_data = encoded_data + "=" * padding_needed
-            decoded_bytes = base64.b64decode(padded_data)
-            return decoded_bytes.decode("utf-8")
-        except (binascii.Error, UnicodeDecodeError) as e:
-            raise ValueError(f"Base64 decryption failed: {e}")
-
-    def decrypt(self, encrypted_data: str, only_base64: bool = False):
+    def decrypt(self, data, only_base64=False):
         if only_base64:
-            return self._base64_decode(encrypted_data)
+            return self._b64d(data)
 
-        decrypted_string = ""
         if self.method == "bytes":
-            decrypted_string = self.decrypt_bytes(encrypted_data)
+            result = self._decrypt_bytes(data)
         elif self.method == "binary":
-            decrypted_string = self.decrypt_binary(encrypted_data)
+            result = self._decrypt_binary(data)
         elif self.method == "shift":
-            decrypted_string = self.decrypt_shift(encrypted_data)
+            result = self._decrypt_shift(data)
         else:
-            raise ValueError(f"Metode dekripsi '{self.method}' tidak dikenali.")
+            raise ValueError("Invalid method")
+
+        if isinstance(result, (list, dict)):
+            return result
 
         try:
-            return json.loads(decrypted_string)
-        except (json.JSONDecodeError, TypeError):
-            return decrypted_string
+            return json.loads(result)
+        except:
+            pass
 
-    def decrypt_binary(self, encrypted_bits: str) -> str:
-        if not encrypted_bits or len(encrypted_bits) % 8 != 0:
-            raise ValueError("Data biner yang dienkripsi tidak valid atau kosong.")
-        decrypted_chars = [
-            chr(int(encrypted_bits[i : i + 8], 2) ^ int(self.numeric_key) % 256)
-            for i in range(0, len(encrypted_bits), 8)
-        ]
-        return "".join(decrypted_chars)
+        if isinstance(result, str):
+            try:
+                parsed = ast.literal_eval(result)
+                if isinstance(parsed, list):
+                    return parsed
+            except:
+                pass
 
-    def decrypt_bytes(self, encrypted_data: str) -> str:
-        try:
-            encrypted_bytes = bytes.fromhex(encrypted_data)
-            decrypted_bytes = self._xor_encrypt_decrypt(encrypted_bytes)
-            return decrypted_bytes.decode("utf-8")
-        except Exception as e:
-            raise Exception(f"Decryption failed for 'bytes' method: {e}")
+        return result
 
-    def decrypt_shift(self, encoded_text: str) -> str:
-        try:
-            codes = encoded_text.split(self.delimiter)
-            return "".join(chr(int(code, 16) - ord(self.key[i % len(self.key)])) for i, code in enumerate(codes))
-        except (ValueError, TypeError) as error:
-            raise ValueError(f"Error during shift decryption: {error}")
-
-    def encrypt(self, data, only_base64: bool = False) -> str:
-        if only_base64:
-            return self._base64_encode(data)
-
+    def _decrypt_bytes(self, data):
         if not isinstance(data, str):
-            message_to_encrypt = json.dumps(data, separators=(",", ":"))
-        else:
-            message_to_encrypt = data
+            return data
+
+        s = data.strip()
+        if not s:
+            return data
+
+        if not all(c in "0123456789abcdefABCDEF" for c in s):
+            return data
+
+        try:
+            raw = bytes.fromhex(s)
+            return self._xor(raw).decode()
+        except:
+            return data
+
+    def _decrypt_binary(self, data):
+        if not isinstance(data, str) or len(data) % 8 != 0:
+            return data
+        try:
+            key_val = int(self.numeric_key) % 256
+            return "".join(chr(int(data[i:i+8], 2) ^ key_val) for i in range(0, len(data), 8))
+        except:
+            return data
+
+    def _decrypt_shift(self, data):
+        if not isinstance(data, str):
+            return data
+        try:
+            parts = data.split(self.delimiter)
+            return "".join(chr(int(p, 16) - ord(self.key[i % len(self.key)])) for i, p in enumerate(parts))
+        except:
+            return data
+
+    def encrypt(self, data, only_base64=False):
+        if only_base64:
+            return self._b64e(data)
+
+        text = json.dumps(data, separators=(",", ":")) if not isinstance(data, str) else data
 
         if self.method == "bytes":
-            return self.encrypt_bytes(message_to_encrypt)
-        elif self.method == "binary":
-            return self.encrypt_binary(message_to_encrypt)
-        elif self.method == "shift":
-            return self.encrypt_shift(message_to_encrypt)
-        else:
-            raise ValueError(f"Metode enkripsi '{self.method}' tidak dikenali.")
+            return self._encrypt_bytes(text)
+        if self.method == "binary":
+            return self._encrypt_binary(text)
+        if self.method == "shift":
+            return self._encrypt_shift(text)
 
-    def encrypt_binary(self, plaintext: str) -> str:
-        xor_key = int(self.numeric_key) % 256
-        encrypted_bits = "".join(format(ord(char) ^ xor_key, "08b") for char in plaintext)
-        return encrypted_bits
+        raise ValueError("Invalid method")
 
-    def encrypt_bytes(self, message: str) -> str:
-        try:
-            encrypted_bytes = self._xor_encrypt_decrypt(message.encode("utf-8"))
-            return encrypted_bytes.hex()
-        except Exception as e:
-            raise Exception(f"Encryption failed for 'bytes' method: {e}")
+    def _encrypt_bytes(self, text):
+        return self._xor(text.encode()).hex()
 
-    def encrypt_shift(self, text: str) -> str:
-        encoded_hex = [hex(ord(text[i]) + ord(self.key[i % len(self.key)])) for i in range(len(text))]
-        return self.delimiter.join(encoded_hex)
+    def _encrypt_binary(self, text):
+        key_val = int(self.numeric_key) % 256
+        return "".join(format(ord(c) ^ key_val, "08b") for c in text)
+
+    def _encrypt_shift(self, text):
+        return self.delimiter.join(
+            hex(ord(text[i]) + ord(self.key[i % len(self.key)]))
+            for i in range(len(text))
+        )
 
     def save(self, filename: str, code: str, key_by_config: str = None):
         encrypted_code = self.encrypt(code)
-        if encrypted_code is None:
-            raise ValueError("Encryption failed, cannot save.")
 
-        to_hex = lambda s: s.encode("utf-8").hex()
-
-        if key_by_config is not None:
-            key_expression = key_by_config
-        else:
-            key_expression = repr(self.key)
+        to_hex = lambda s: s.encode().hex()
+        key_expr = key_by_config if key_by_config else repr(self.key)
 
         hex_map = {
             "n": to_hex("nsdev"),
@@ -171,94 +151,74 @@ class CipherHandler:
             "f": to_hex("FunctionType"),
             "e": to_hex("eval"),
             "M": to_hex(self.method),
-            "K": to_hex(key_expression),
+            "K": to_hex(key_expr),
         }
 
-        result = f"(lambda d, h, x: (lambda b, i, g, c, t, f, e: f(c(g(g(i(x(h['n'])), x(h['C']))(**{{'method': x(h['M']), 'key': e(x(h['K']))}}), 'decrypt')(d), '<string>', 'exec'), t())())(__import__(x(h['b'])),lambda n: __import__(x(h['b'])).__dict__[x(h['i'])](n),lambda o, n: __import__(x(h['b'])).__dict__[x(h['a'])](o, n),lambda *a: __import__(x(h['b'])).__dict__[x(h['c'])](*a),lambda: __import__(x(h['b'])).__dict__[x(h['g'])](),lambda *a: __import__(x(h['b'])).__dict__[x(h['a'])](__import__(x(h['t'])), x(h['f']))(*a),lambda s: __import__(x(h['b'])).__dict__[x(h['e'])](s)))('{encrypted_code}', {hex_map}, lambda s: bytes.fromhex(s).decode('utf-8'))"
+        result = f"(lambda d, h, x: (lambda b, i, g, c, t, f, e: f(c(g(g(i(x(h['n'])), x(h['C']))(**{{'method': x(h['M']), 'key': e(x(h['K']))}}), 'decrypt')(d), '<string>', 'exec'), t())())(__import__(x(h['b'])),lambda n: __import__(x(h['b'])).__dict__[x(h['i'])](n),lambda o, n: __import__(x(h['b'])).__dict__[x(h['a'])](o, n),lambda *a: __import__(x(h['b'])).__dict__[x(h['c'])](*a),lambda: __import__(x(h['b'])).__dict__[x(h['g'])](),lambda *a: __import__(x(h['b'])).__dict__[x(h['a'])](__import__(x(h['t'])), x(h['f']))(*a),lambda s: __import__(x(h['b'])).__dict__[x(h['e'])](s)))('{encrypted_code}', {hex_map}, lambda s: bytes.fromhex(s).decode())"
 
-        try:
-            with open(filename, "w") as file:
-                file.write(result)
-            self.log.info(f"Kode berhasil disimpan ke file {filename}")
-        except Exception as e:
-            raise IOError(f"Saving file failed: {e}")
+        with open(filename, "w") as f:
+            f.write(result)
+
+        self.log.info(f"Kode berhasil disimpan ke file {filename}")
 
 
 class AsciiManager(AnsiColors):
+
     def __init__(self, key):
         super().__init__()
-        try:
-            self.no_format_key = key
-            self.key = self._normalize_key(key)
-            if not self.key:
-                raise ValueError("Key cannot be empty.")
-        except Exception as e:
-            raise Exception(f"Initialization failed: {e}")
+        self.raw_key = key
+        self.key = self._normalize_key(key)
 
-    def _normalize_key(self, key) -> str:
-        try:
-            if isinstance(key, list):
-                return "".join(map(str, key))
-            return str(key)
-        except Exception as e:
-            raise Exception(f"Key normalization failed: {e}")
+        if not self.key:
+            raise ValueError("Key cannot be empty.")
 
-    def _offset(self, index: int) -> int:
-        try:
-            key_char_code = ord(self.key[index % len(self.key)])
-            return len(self.key) * (index + 1) + key_char_code
-        except Exception as e:
-            raise Exception(f"Offset calculation failed at index {index}: {e}")
+    def _normalize_key(self, key):
+        if isinstance(key, list):
+            return "".join(map(str, key))
+        return str(key)
 
-    def encrypt(self, data) -> list[int]:
-        try:
-            if not isinstance(data, str):
-                message = json.dumps(data, separators=(",", ":"))
-            else:
-                message = data
-            return [int(ord(char) + self._offset(i)) for i, char in enumerate(message)]
-        except Exception as e:
-            raise Exception(f"Encryption failed: {e}")
+    def _offset(self, i):
+        return len(self.key) * (i + 1) + ord(self.key[i % len(self.key)])
 
-    def decrypt(self, encrypted: list[int]):
+    def encrypt(self, data):
+        text = json.dumps(data, separators=(",", ":")) if not isinstance(data, str) else data
+        return [ord(c) + self._offset(i) for i, c in enumerate(text)]
+
+    def decrypt(self, data):
+        if not isinstance(data, list):
+            return data
         try:
-            decrypted_string = "".join(chr(int(code) - self._offset(i)) for i, code in enumerate(encrypted))
+            text = "".join(chr(int(v) - self._offset(i)) for i, v in enumerate(data))
             try:
-                return json.loads(decrypted_string)
-            except (json.JSONDecodeError, TypeError):
-                return decrypted_string
-        except Exception as e:
-            raise Exception(f"Decryption failed: {e}")
+                return json.loads(text)
+            except:
+                return text
+        except:
+            return data
 
     def save_data(self, filename: str, code: str, key_by_config: str = None):
-        try:
-            encrypted_code = self.encrypt(code)
+        encrypted_code = self.encrypt(code)
 
-            to_hex = lambda s: s.encode("utf-8").hex()
+        to_hex = lambda s: s.encode().hex()
+        key_expr = key_by_config if key_by_config else repr(self.raw_key)
 
-            if key_by_config is not None:
-                key_expression = key_by_config
-            else:
-                key_expression = repr(self.no_format_key)
+        hex_map = {
+            "n": to_hex("nsdev"),
+            "A": to_hex("AsciiManager"),
+            "b": to_hex("builtins"),
+            "t": to_hex("types"),
+            "g": to_hex("globals"),
+            "i": to_hex("__import__"),
+            "a": to_hex("getattr"),
+            "c": to_hex("compile"),
+            "f": to_hex("FunctionType"),
+            "e": to_hex("eval"),
+            "K": to_hex(key_expr),
+        }
 
-            hex_map = {
-                "n": to_hex("nsdev"),
-                "A": to_hex("AsciiManager"),
-                "b": to_hex("builtins"),
-                "t": to_hex("types"),
-                "g": to_hex("globals"),
-                "i": to_hex("__import__"),
-                "a": to_hex("getattr"),
-                "c": to_hex("compile"),
-                "f": to_hex("FunctionType"),
-                "e": to_hex("eval"),
-                "K": to_hex(key_expression),
-            }
+        result = f"(lambda d, h, x: (lambda b, i, g, c, t, f, e: f(c(g(g(i(x(h['n'])), x(h['A']))(e(x(h['K']))), 'decrypt')(d), '<string>', 'exec'), t())())(__import__(x(h['b'])),lambda n: __import__(x(h['b'])).__dict__[x(h['i'])](n),lambda o, n: __import__(x(h['b'])).__dict__[x(h['a'])](o, n),lambda *a: __import__(x(h['b'])).__dict__[x(h['c'])](*a),lambda: __import__(x(h['b'])).__dict__[x(h['g'])](),lambda *a: __import__(x(h['b'])).__dict__[x(h['a'])](__import__(x(h['t'])), x(h['f']))(*a),lambda s: __import__(x(h['b'])).__dict__[x(h['e'])](s)))({str(encrypted_code)}, {hex_map}, lambda s: bytes.fromhex(s).decode())"
 
-            result = f"(lambda d, h, x: (lambda b, i, g, c, t, f, e: f(c(g(g(i(x(h['n'])), x(h['A']))(e(x(h['K']))), 'decrypt')(d), '<string>', 'exec'), t())())(__import__(x(h['b'])),lambda n: __import__(x(h['b'])).__dict__[x(h['i'])](n),lambda o, n: __import__(x(h['b'])).__dict__[x(h['a'])](o, n),lambda *a: __import__(x(h['b'])).__dict__[x(h['c'])](*a),lambda: __import__(x(h['b'])).__dict__[x(h['g'])](),lambda *a: __import__(x(h['b'])).__dict__[x(h['a'])](__import__(x(h['t'])), x(h['f']))(*a),lambda s: __import__(x(h['b'])).__dict__[x(h['e'])](s)))({str(encrypted_code)}, {hex_map}, lambda s: bytes.fromhex(s).decode('utf-8'))"
+        with open(filename, "w") as f:
+            f.write(result)
 
-            with open(filename, "w") as file:
-                file.write(result)
-                print(f"{self.GREEN}Kode berhasil disimpan ke file {filename}{self.RESET}")
-        except Exception as e:
-            raise Exception(f"Failed to save data to {filename}: {e}")
+        print(f"{self.GREEN}Kode berhasil disimpan ke file {filename}{self.RESET}")
