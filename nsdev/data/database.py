@@ -54,6 +54,12 @@ class DataBase:
 
         self._register_backup_task()
 
+    def _safe_json_loads(self, data):
+        try:
+            return json.loads(data)
+        except:
+            return {}
+    
     async def _run_sync(self, func, *args, **kwargs):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, partial(func, *args, **kwargs))
