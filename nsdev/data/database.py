@@ -178,32 +178,32 @@ class DataBase:
         self.conn.commit()
 
     async def _get_user_vars(self, user_id):
-            user_id_str = str(user_id)
+        user_id_str = str(user_id)
 
-            if self.storage_type == "sqlite":
-                row = await self._run_sync(
-                    lambda: self.conn.cursor().execute(
-                        "SELECT data FROM vars WHERE user_id = ?", (user_id_str,)
-                    ).fetchone()
-                )
+        if self.storage_type == "sqlite":
+            row = await self._run_sync(
+                lambda: self.conn.cursor().execute(
+                    "SELECT data FROM vars WHERE user_id = ?", (user_id_str,)
+                ).fetchone()
+            )
 
-                if not row:
-                    return {}
+            if not row:
+                return {}
 
-                try:
-                    decrypted = self.cipher.decrypt(row[0])
-                except:
-                    decrypted = row[0]
+            try:
+                decrypted = self.cipher.decrypt(row[0])
+            except:
+                decrypted = row[0]
 
-                return self._safe_json_loads(decrypted)
+            return self._safe_json_loads(decrypted)
 
-            if self.storage_type == "mongo":
-                data = await self._run_sync(lambda: self.data.vars.find_one({"_id": user_id_str}))
-                return data if data else {}
-                
-            data = await self._load_data()
-            return data.get("vars", {}).get(user_id_str, {})
-        
+        if self.storage_type == "mongo":
+            data = await self._run_sync(lambda: self.data.vars.find_one({"_id": user_id_str}))
+            return data if data else {}
+
+        data = await self._load_data()
+        return data.get("vars", {}).get(user_id_str, {})
+    
     async def _set_user_vars(self, user_id, user_data):
         user_id_str = str(user_id)
 
