@@ -1,9 +1,8 @@
 import asyncio
 import io
 import json
-import time
 import re
-import logging
+import time
 from typing import Optional, Tuple, Dict, Any
 
 import cloudscraper
@@ -30,63 +29,79 @@ class SaweriaScraper(QrCodeGenerator):
         "Content-Type": "application/json",
         "Referer": "https://saweria.co/",
         "Origin": "https://saweria.co",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
     }
 
     def __init__(self, timeout: int = 15):
         super().__init__()
         self.timeout = timeout
-        self.scraper = cloudscraper.create_scraper()
 
-    def _get_json(self, url: str) -> Dict[str, Any]:
-        res = self.scraper.get(url, headers=self.HEADERS, timeout=self.timeout)
-        if not res.ok:
-            raise SaweriaError(f"GET {res.status_code}: {res.text}")
-        return res.json()
+    def _create_scraper(self):
+        return cloudscraper.create_scraper()
 
-    def _post_json(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        res = self.scraper.post(
-            url,
-            json=payload,
-            headers=self.HEADERS,
-            timeout=self.timeout,
-        )
-        if not res.ok:
-            raise SaweriaError(f"POST {res.status_code}: {res.text}")
-        return res.json()
+    def _get_json(self, url: str, retries: int = 3) -> Dict[str, Any]:
+        last_error = None
+        for attempt in range(retries):
+            try:
+                scraper = self._create_scraper()
+                res = scraper.get(url, headers=self.HEADERS, timeout=self.timeout)
+                if not res.ok:
+                    raise SaweriaError(f"GET {res.status_code}: {res.text}")
+                return res.json()
+            except Exception as e:
+                last_error = e
+                time.sleep(2 * (attempt + 1))
+        raise SaweriaError(f"GET request failed after retries: {last_error}")
+
+    def _post_json(self, url: str, payload: Dict[str, Any], retries: int = 3) -> Dict[str, Any]:
+        last_error = None
+        for attempt in range(retries):
+            try:
+                scraper = self._create_scraper()
+                res = scraper.post(
+                    url,
+                    json=payload,
+                    headers=self.HEADERS,
+                    timeout=self.timeout,
+                )
+                if not res.ok:
+                    raise SaweriaError(f"POST {res.status_code}: {res.text}")
+                return res.json()
+            except Exception as e:
+                last_error = e
+                time.sleep(2 * (attempt + 1))
+        raise SaweriaError(f"POST request failed after retries: {last_error}")
 
     async def get_user_id(
         self,
         username: str,
         retries: int = 3,
-        delay: int = 5,
+        delay: int = 3,
     ) -> Optional[str]:
         if not isinstance(username, str) or not username.strip():
             raise ValueError("Username tidak valid")
 
         def _sync() -> Optional[str]:
-            url = f"{self.FRONTEND}/{username}"
-            for _ in range(retries):
+            url = f"{self.FRONTEND}/{username.strip()}"
+            for attempt in range(retries):
                 try:
-                    res = self.scraper.get(
-                        url,
-                        headers=self.HEADERS,
-                        timeout=self.timeout,
-                    )
+                    scraper = self._create_scraper()
+                    res = scraper.get(url, headers=self.HEADERS, timeout=self.timeout)
                     if res.ok:
                         soup = BeautifulSoup(res.text, "html.parser")
                         next_data = soup.find(id="__NEXT_DATA__")
-                        if not next_data:
-                            continue
-                        data = json.loads(next_data.text)
-                        return (
-                            data.get("props", {})
-                            .get("pageProps", {})
-                            .get("data", {})
-                            .get("id")
-                        )
+                        if next_data:
+                            data = json.loads(next_data.text)
+                            return (
+                                data.get("props", {})
+                                .get("pageProps", {})
+                                .get("data", {})
+                                .get("id")
+                            )
                 except Exception:
                     pass
-                time.sleep(delay)
+                time.sleep(delay * (attempt + 1))
             return None
 
         return await asyncio.to_thread(_sync)
@@ -119,17 +134,16 @@ class SaweriaScraper(QrCodeGenerator):
         }
 
         def _sync() -> Dict[str, Any]:
-            data = self._post_json(
-                f"{self.BACKEND}/donations/{user_id}",
-                payload,
-            )
-            return data.get("data", {})
+            return self._post_json(f"{self.BACKEND}/donations/{user_id}", payload).get("data", {})
 
         data = await asyncio.to_thread(_sync)
 
-        qr_string = data["qr_string"]
-        transaction_id = data["id"]
-        amount_raw = data["amount_raw"]
+        qr_string = data.get("qr_string")
+        transaction_id = data.get("id")
+        amount_raw = data.get("amount_raw")
+
+        if not qr_string or not transaction_id:
+            raise SaweriaError("Invalid response from Saweria API")
 
         qr_bytes = await self.generate(
             data=qr_string,
@@ -142,27 +156,28 @@ class SaweriaScraper(QrCodeGenerator):
         stream = io.BytesIO(qr_bytes)
         stream.name = f"{transaction_id}.png"
 
-        return qr_string, transaction_id, stream, amount_raw
+        return qr_string, transaction_id, stream, int(amount_raw or 0)
 
     async def check_paid_status(self, transaction_id: str) -> bool:
         def _sync() -> bool:
-            data = self._get_json(
-                f"{self.BACKEND}/donations/qris/{transaction_id}"
-            ).get("data", {})
+            data = self._get_json(f"{self.BACKEND}/donations/qris/{transaction_id}").get("data", {})
             if data.get("paid_at"):
                 return True
             if data.get("status"):
-                return data["status"].upper() == "PAID"
+                return str(data["status"]).upper() == "PAID"
             return False
 
         return await asyncio.to_thread(_sync)
 
     def get_amount(self, qr_text: str) -> Optional[int]:
-        matches = re.findall(r"54(\d{2})(\d+)", qr_text)
-        if not matches:
+        match = re.search(r"54(\d{2})(\d+)", qr_text)
+        if not match:
             return None
-        length, value = matches[-1]
+
+        length = int(match.group(1))
+        value = match.group(2)[:length]
+
         try:
-            return int(value[: int(length)])
-        except Exception:
+            return int(value)
+        except ValueError:
             return None
