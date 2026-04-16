@@ -21,6 +21,7 @@ from .code import AsciiManager, CipherHandler
 from .data import DataBase, KeyManager, YamlHandler
 from .payment import (
     PaymentCashify,
+    PaymentQRPW,
     PaymentMidtrans,
     PaymentTripay,
     SaweriaApi,
@@ -70,13 +71,14 @@ from .utils import (
     memoize,
 )
 
-__version__ = "0.38"
+__version__ = "0.39"
 __author__ = "@Norsodikin"
 
 
 class NsDev:
     def __init__(self, client):
         self._client = client
+
         self.ai = SimpleNamespace(
             bing=ImageGenerator,
             gemini=ChatbotGemini,
@@ -92,36 +94,45 @@ class NsDev:
             voicecloning=VoiceCloner,
             web=WebSummarizer,
         )
+
         self.analytics = SimpleNamespace(
             manager=AnalyticsManager,
             chat=ChatAnalyzer,
         )
+
         self.auth = AuthManager
+
         self.code = SimpleNamespace(
-            Ascii=AsciiManager,
-            Cipher=CipherHandler,
+            ascii=AsciiManager,
+            cipher=CipherHandler,
         )
+
         self.data = SimpleNamespace(
             db=DataBase,
             key=KeyManager,
             yaml=YamlHandler(),
         )
+
         self.payment = SimpleNamespace(
-            Cashify=PaymentCashify,
-            Midtrans=PaymentMidtrans,
-            Saweria=SaweriaApi,
-            SaweriaScraper=SaweriaScraper,
-            Tripay=PaymentTripay,
-            Violet=VioletMediaPayClient,
+            cashify=PaymentCashify,
+            qrpw=PaymentQRPW,
+            midtrans=PaymentMidtrans,
+            saweria=SaweriaApi,
+            saweria_scraper=SaweriaScraper,
+            tripay=PaymentTripay,
+            violet=VioletMediaPayClient,
         )
+
         self.pinterest = Pinterest()
         self.schedule = Scheduler()
+
         self.server = SimpleNamespace(
             monitor=ServerMonitor(),
             process=ProcessManager(),
             speedtest=SpeedtestRunner(),
             user=SSHUserManager,
         )
+
         self.telegram = SimpleNamespace(
             actions=TelegramActions(self._client),
             arg=Argument(self._client),
@@ -132,7 +143,9 @@ class NsDev:
             story=StoryDownloader(self._client),
             videofx=VideoFX(),
         )
+
         self.tempmail = TempMailManager()
+
         self.utils = SimpleNamespace(
             audiofx=AudioFX(),
             cache=memoize,
