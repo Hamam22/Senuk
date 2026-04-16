@@ -4,3 +4,4 @@ from .saweria import SaweriaApi
 from .saweria_scraper import SaweriaScraper
 from .tripay import PaymentTripay
 from .violet import VioletMediaPayClient
+from .qrpw import PaymentQRPW
