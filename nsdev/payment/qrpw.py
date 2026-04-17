@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
-import json
 from typing import Any, Dict, Optional
 
 import httpx
@@ -22,13 +19,20 @@ class QRPWConnectionError(QRPWError):
     pass
 
 
+class QRPWStatus:
+    PENDING = "pending"
+    PAID = "paid"
+    EXPIRED = "expired"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 class PaymentQRPW:
     def __init__(
         self,
         api_key: str,
         api_secret: str,
         *,
-        webhook_secret: Optional[str] = None,
         timeout: float = 30.0,
         max_retries: int = 3,
     ):
@@ -39,9 +43,8 @@ class PaymentQRPW:
 
         self.api_key = api_key
         self.api_secret = api_secret
-        self.webhook_secret = webhook_secret
-
         self.base_url = "https://qris.pw/api"
+
         self.timeout = httpx.Timeout(timeout)
         self.max_retries = max_retries
         self.convert = YamlHandler()
@@ -58,9 +61,9 @@ class PaymentQRPW:
 
     def _headers(self) -> Dict[str, str]:
         return {
-            "Content-Type": "application/json",
             "X-API-Key": self.api_key,
             "X-API-Secret": self.api_secret,
+            "Content-Type": "application/json",
         }
 
     async def _request(
@@ -68,30 +71,31 @@ class PaymentQRPW:
         method: str,
         endpoint: str,
         *,
-        json_data: Optional[Dict[str, Any]] = None,
+        json: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
         raw: bool = False,
     ):
         url = endpoint if endpoint.startswith("http") else f"{self.base_url}{endpoint}"
 
         for attempt in range(self.max_retries):
+            client = self._client or httpx.AsyncClient(timeout=self.timeout)
             try:
-                client = self._client or httpx.AsyncClient(timeout=self.timeout)
+                if method.upper() == "POST":
+                    res = await client.post(
+                        url,
+                        headers=self._headers(),
+                        json=json,
+                        params=params,
+                    )
+                else:
+                    res = await client.get(
+                        url,
+                        headers=self._headers(),
+                        params=params,
+                    )
 
-                response = await client.request(
-                    method=method,
-                    url=url,
-                    headers=self._headers(),
-                    json=json_data,
-                    params=params,
-                )
-                response.raise_for_status()
-
-                if raw:
-                    return response.content
-
-                data = response.json()
-                return self.convert._convertToNamespace(data)
+                res.raise_for_status()
+                return res.content if raw else self.convert._convertToNamespace(res.json())
 
             except httpx.HTTPStatusError as e:
                 raise QRPWHTTPError(
@@ -110,30 +114,29 @@ class PaymentQRPW:
     async def create_payment(
         self,
         amount: int,
-        order_id: str,
-        customer_name: str,
-        callback_url: str,
+        order_id: Optional[str] = None,
+        customer_name: Optional[str] = None,
+        customer_phone: Optional[str] = None,
+        callback_url: Optional[str] = None,
     ):
-        if amount <= 0:
-            raise ValueError("amount harus lebih dari 0")
-        if not order_id:
-            raise ValueError("order_id wajib diisi")
-        if not customer_name:
-            raise ValueError("customer_name wajib diisi")
-        if not callback_url:
-            raise ValueError("callback_url wajib diisi")
+        if amount < 1000:
+            raise ValueError("amount minimal 1000")
 
-        payload = {
-            "amount": amount,
-            "order_id": order_id,
-            "customer_name": customer_name,
-            "callback_url": callback_url,
-        }
+        payload = {"amount": amount}
+
+        if order_id:
+            payload["order_id"] = order_id
+        if customer_name:
+            payload["customer_name"] = customer_name
+        if customer_phone:
+            payload["customer_phone"] = customer_phone
+        if callback_url:
+            payload["callback_url"] = callback_url
 
         return await self._request(
             "POST",
             "/create-payment.php",
-            json_data=payload,
+            json=payload,
         )
 
     async def check_status(self, transaction_id: str):
@@ -146,25 +149,22 @@ class PaymentQRPW:
             params={"transaction_id": transaction_id},
         )
 
-    def verify_webhook_signature(
-        self,
-        webhook_data: Dict[str, Any],
-        webhook_secret: Optional[str] = None,
-    ) -> bool:
-        secret = webhook_secret or self.webhook_secret
-        if not secret:
-            raise ValueError("webhook_secret wajib diisi")
+    @staticmethod
+    def is_pending(status: str) -> bool:
+        return status == QRPWStatus.PENDING
 
-        if "signature" not in webhook_data:
-            return False
+    @staticmethod
+    def is_paid(status: str) -> bool:
+        return status == QRPWStatus.PAID
 
-        payload_to_sign = {k: v for k, v in webhook_data.items() if k != "signature"}
-        payload = json.dumps(payload_to_sign, separators=(",", ":"), ensure_ascii=False)
+    @staticmethod
+    def is_expired(status: str) -> bool:
+        return status == QRPWStatus.EXPIRED
 
-        expected_signature = hmac.new(
-            secret.encode(),
-            payload.encode(),
-            hashlib.sha256,
-        ).hexdigest()
+    @staticmethod
+    def is_failed(status: str) -> bool:
+        return status == QRPWStatus.FAILED
 
-        return hmac.compare_digest(expected_signature, str(webhook_data["signature"]))
+    @staticmethod
+    def is_cancelled(status: str) -> bool:
+        return status == QRPWStatus.CANCELLED
