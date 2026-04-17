@@ -78,8 +78,9 @@ class PaymentQRPW:
         url = endpoint if endpoint.startswith("http") else f"{self.base_url}{endpoint}"
 
         for attempt in range(self.max_retries):
-            client = self._client or httpx.AsyncClient(timeout=self.timeout)
             try:
+                client = self._client or httpx.AsyncClient(timeout=self.timeout)
+
                 if method.upper() == "POST":
                     res = await client.post(
                         url,
