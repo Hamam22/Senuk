@@ -19,6 +19,10 @@ class QRPWConnectionError(QRPWError):
     pass
 
 
+class QRPWAPIError(QRPWError):
+    pass
+
+
 class QRPWStatus:
     PENDING = "pending"
     PAID = "paid"
@@ -44,11 +48,9 @@ class PaymentQRPW:
         self.api_key = api_key
         self.api_secret = api_secret
         self.base_url = "https://qris.pw/api"
-
         self.timeout = httpx.Timeout(timeout)
         self.max_retries = max_retries
         self.convert = YamlHandler()
-
         self._client: Optional[httpx.AsyncClient] = None
 
     async def __aenter__(self):
@@ -78,30 +80,41 @@ class PaymentQRPW:
         url = endpoint if endpoint.startswith("http") else f"{self.base_url}{endpoint}"
 
         for attempt in range(self.max_retries):
+            client = self._client or httpx.AsyncClient(timeout=self.timeout)
+
             try:
-                client = self._client or httpx.AsyncClient(timeout=self.timeout)
+                response = await client.request(
+                    method=method.upper(),
+                    url=url,
+                    headers=self._headers(),
+                    json=json,
+                    params=params,
+                )
 
-                if method.upper() == "POST":
-                    res = await client.post(
-                        url,
-                        headers=self._headers(),
-                        json=json,
-                        params=params,
+                if raw:
+                    response.raise_for_status()
+                    return response.content
+
+                try:
+                    data = response.json()
+                except Exception:
+                    data = None
+
+                if response.is_error:
+                    error_msg = None
+                    if isinstance(data, dict):
+                        error_msg = data.get("error") or data.get("message")
+                    raise QRPWHTTPError(
+                        f"{response.status_code} - {error_msg or response.text}"
                     )
-                else:
-                    res = await client.get(
-                        url,
-                        headers=self._headers(),
-                        params=params,
-                    )
 
-                res.raise_for_status()
-                return res.content if raw else self.convert._convertToNamespace(res.json())
+                if isinstance(data, dict) and data.get("success") is False:
+                    raise QRPWAPIError(data.get("error") or "API mengembalikan error")
 
-            except httpx.HTTPStatusError as e:
-                raise QRPWHTTPError(
-                    f"{e.response.status_code} - {e.response.text}"
-                ) from e
+                if data is None:
+                    raise QRPWAPIError("Response API bukan JSON yang valid")
+
+                return self.convert._convertToNamespace(data)
 
             except httpx.RequestError as e:
                 if attempt == self.max_retries - 1:
@@ -123,7 +136,9 @@ class PaymentQRPW:
         if amount < 1000:
             raise ValueError("amount minimal 1000")
 
-        payload = {"amount": amount}
+        payload: Dict[str, Any] = {
+            "amount": amount,
+        }
 
         if order_id:
             payload["order_id"] = order_id
