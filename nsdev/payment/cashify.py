@@ -47,12 +47,16 @@ class PaymentCashify:
     async def __aexit__(self, *args):
         if self._client:
             await self._client.aclose()
+            self._client = None
 
-    def _headers(self) -> Dict[str, str]:
-        return {
+    def _headers(self, *, is_json: bool = True) -> Dict[str, str]:
+        headers = {
             "x-license-key": self.license_key,
-            "content-type": "application/json",
         }
+        if is_json:
+            headers["content-type"] = "application/json"
+            headers["accept"] = "application/json"
+        return headers
 
     async def _request(
         self,
@@ -63,32 +67,61 @@ class PaymentCashify:
         raw: bool = False,
     ):
         url = endpoint if endpoint.startswith("http") else f"{self.base_url}{endpoint}"
+        retryable_statuses = {429, 502, 503, 504}
 
-        for attempt in range(self.max_retries):
-            try:
-                client = self._client or httpx.AsyncClient(timeout=self.timeout)
+        own_client = self._client is None
+        client = self._client or httpx.AsyncClient(timeout=self.timeout)
 
-                if method == "POST":
-                    res = await client.post(url, headers=self._headers(), json=json)
-                else:
-                    res = await client.get(url, headers=self._headers())
+        try:
+            for attempt in range(self.max_retries):
+                try:
+                    res = await client.request(
+                        method=method.upper(),
+                        url=url,
+                        headers=self._headers(is_json=not raw),
+                        json=json if method.upper() != "GET" else None,
+                    )
 
-                res.raise_for_status()
-                return res.content if raw else self.convert._convertToNamespace(res.json())
+                    # retry untuk status transient
+                    if res.status_code in retryable_statuses:
+                        if attempt < self.max_retries - 1:
+                            await asyncio.sleep(2**attempt)
+                            continue
 
-            except httpx.HTTPStatusError as e:
-                raise CashifyHTTPError(
-                    f"{e.response.status_code} - {e.response.text}"
-                ) from e
+                    res.raise_for_status()
 
-            except httpx.RequestError as e:
-                if attempt == self.max_retries - 1:
-                    raise CashifyConnectionError(str(e)) from e
-                await asyncio.sleep(2**attempt)
+                    if raw:
+                        return res.content
 
-            finally:
-                if not self._client:
-                    await client.aclose()
+                    content_type = res.headers.get("content-type", "")
+                    if "application/json" not in content_type.lower():
+                        preview = res.text[:500]
+                        raise CashifyHTTPError(
+                            f"Respons non-JSON dari server: {res.status_code} - {preview}"
+                        )
+
+                    return self.convert._convertToNamespace(res.json())
+
+                except httpx.HTTPStatusError as e:
+                    status_code = e.response.status_code
+                    preview = e.response.text[:500]
+
+                    if status_code in retryable_statuses and attempt < self.max_retries - 1:
+                        await asyncio.sleep(2**attempt)
+                        continue
+
+                    raise CashifyHTTPError(
+                        f"{status_code} - {preview}"
+                    ) from e
+
+                except httpx.RequestError as e:
+                    if attempt == self.max_retries - 1:
+                        raise CashifyConnectionError(str(e)) from e
+                    await asyncio.sleep(2**attempt)
+
+        finally:
+            if own_client:
+                await client.aclose()
 
     async def generate_qris(
         self,
