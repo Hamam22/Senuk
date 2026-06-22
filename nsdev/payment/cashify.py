@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
 
 import httpx
 
@@ -44,7 +45,6 @@ class PaymentCashify:
         self.timeout = httpx.Timeout(timeout, connect=10.0, read=30.0, write=10.0)
         self.max_retries = max(1, int(max_retries))
         self.convert = YamlHandler()
-
         self._client: Optional[httpx.AsyncClient] = None
 
     async def __aenter__(self):
@@ -56,14 +56,15 @@ class PaymentCashify:
         await self.aclose()
 
     async def aclose(self):
-        if self._client is not None:
+        if self._client:
             await self._client.aclose()
             self._client = None
 
-    def _headers(self, *, expect_json: bool = True) -> Dict[str, str]:
-        headers = {
-            "x-license-key": self.license_key,
-        }
+    def _headers(self, *, expect_json: bool = True, with_license: bool = True) -> Dict[str, str]:
+        headers: Dict[str, str] = {}
+
+        if with_license:
+            headers["x-license-key"] = self.license_key
 
         if expect_json:
             headers["content-type"] = "application/json"
@@ -82,7 +83,9 @@ class PaymentCashify:
         *,
         json: Optional[Dict[str, Any]] = None,
         raw: bool = False,
+        with_license: bool = True,
     ):
+        method = method.upper()
         url = endpoint if endpoint.startswith("http") else f"{self.base_url}{endpoint}"
 
         own_client = self._client is None
@@ -92,17 +95,17 @@ class PaymentCashify:
             for attempt in range(self.max_retries):
                 try:
                     response = await client.request(
-                        method=method.upper(),
+                        method=method,
                         url=url,
-                        headers=self._headers(expect_json=not raw),
-                        json=json if method.upper() != "GET" else None,
+                        headers=self._headers(
+                            expect_json=not raw,
+                            with_license=with_license,
+                        ),
+                        json=json if method != "GET" else None,
                     )
 
-                    if (
-                        response.status_code in self.RETRYABLE_STATUSES
-                        and attempt < self.max_retries - 1
-                    ):
-                        await asyncio.sleep(2**attempt)
+                    if response.status_code in self.RETRYABLE_STATUSES and attempt < self.max_retries - 1:
+                        await asyncio.sleep(2 ** attempt)
                         continue
 
                     response.raise_for_status()
@@ -123,11 +126,8 @@ class PaymentCashify:
                     status_code = e.response.status_code
                     preview = self._preview_text(e.response.text)
 
-                    if (
-                        status_code in self.RETRYABLE_STATUSES
-                        and attempt < self.max_retries - 1
-                    ):
-                        await asyncio.sleep(2**attempt)
+                    if status_code in self.RETRYABLE_STATUSES and attempt < self.max_retries - 1:
+                        await asyncio.sleep(2 ** attempt)
                         continue
 
                     raise CashifyHTTPError(f"{status_code} - {preview}") from e
@@ -135,7 +135,7 @@ class PaymentCashify:
                 except httpx.RequestError as e:
                     if attempt >= self.max_retries - 1:
                         raise CashifyConnectionError(str(e)) from e
-                    await asyncio.sleep(2**attempt)
+                    await asyncio.sleep(2 ** attempt)
 
         finally:
             if own_client:
@@ -166,12 +166,18 @@ class PaymentCashify:
         return await self._request("POST", "/generate/qris", json=payload)
 
     async def check_status(self, payment_id: str):
-        payload = {"transactionId": payment_id}
-        return await self._request("POST", "/generate/check-status", json=payload)
+        return await self._request(
+            "POST",
+            "/generate/check-status",
+            json={"transactionId": payment_id},
+        )
 
     async def cancel_payment(self, transaction_id: str):
-        payload = {"transactionId": transaction_id}
-        return await self._request("POST", "/generate/cancel-status", json=payload)
+        return await self._request(
+            "POST",
+            "/generate/cancel-status",
+            json={"transactionId": transaction_id},
+        )
 
     def generate_stylish_qr(
         self,
@@ -180,12 +186,14 @@ class PaymentCashify:
         style: Optional[int] = None,
         color: Optional[str] = None,
     ) -> str:
-        style = style or 1
-        color = color or "000000"
-        return (
-            f"{self.qr_generator_url}"
-            f"?size={size}&style={style}&color={color}&data={data}"
-        )
+        params = urlencode({
+            "size": size,
+            "style": style or 1,
+            "color": color or "000000",
+            "data": data,
+        })
+
+        return f"{self.qr_generator_url}?{params}"
 
     async def download_qr_image(
         self,
@@ -195,4 +203,4 @@ class PaymentCashify:
         color: Optional[str] = None,
     ):
         qr_url = self.generate_stylish_qr(data, size, style, color)
-        return await self._request("GET", qr_url, raw=True)
+        return await self._request("GET", qr_url, raw=True, with_license=False)
