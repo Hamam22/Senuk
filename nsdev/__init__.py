@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from typing import Any
 
 from .ai import (
     ChatbotGemini,
@@ -21,8 +22,8 @@ from .code import AsciiManager, CipherHandler
 from .data import DataBase, KeyManager, YamlHandler
 from .payment import (
     PaymentCashify,
-    PaymentQRPW,
     PaymentMidtrans,
+    PaymentQRPW,
     PaymentTripay,
     SaweriaApi,
     SaweriaScraper,
@@ -71,12 +72,17 @@ from .utils import (
     memoize,
 )
 
-__version__ = "0.39"
+__version__ = "0.40"
 __author__ = "@Norsodikin"
+
+__all__ = [
+    "NsDev",
+    "ns",
+]
 
 
 class NsDev:
-    def __init__(self, client):
+    def __init__(self, client: Any) -> None:
         self._client = client
 
         self.ai = SimpleNamespace(
@@ -115,8 +121,8 @@ class NsDev:
 
         self.payment = SimpleNamespace(
             cashify=PaymentCashify,
-            qrpw=PaymentQRPW,
             midtrans=PaymentMidtrans,
+            qrpw=PaymentQRPW,
             saweria=SaweriaApi,
             saweria_scraper=SaweriaScraper,
             tripay=PaymentTripay,
@@ -134,13 +140,13 @@ class NsDev:
         )
 
         self.telegram = SimpleNamespace(
-            actions=TelegramActions(self._client),
-            arg=Argument(self._client),
+            actions=TelegramActions(client),
+            arg=Argument(client),
             button=Button(),
-            copier=MessageCopier(self._client),
-            errors=ErrorHandler(self._client),
+            copier=MessageCopier(client),
+            errors=ErrorHandler(client),
             formatter=TextFormatter,
-            story=StoryDownloader(self._client),
+            story=StoryDownloader(client),
             videofx=VideoFX(),
         )
 
@@ -165,7 +171,7 @@ class NsDev:
             osint=OsintTools,
             paste=PasteClient,
             progress=TelegramProgressBar,
-            ratelimit=RateLimiter(self._client),
+            ratelimit=RateLimiter(client),
             shell=ShellExecutor(),
             splitter=AudioSplitter,
             url=UrlUtils(),
@@ -176,15 +182,20 @@ class NsDev:
 
 
 @property
-def ns(self) -> NsDev:
-    if not hasattr(self, "_nsdev_instance"):
-        self._nsdev_instance = NsDev(self)
-    return self._nsdev_instance
+def ns(self: Any) -> NsDev:
+    instance = getattr(self, "_nsdev_instance", None)
+
+    if instance is None:
+        instance = NsDev(self)
+        setattr(self, "_nsdev_instance", instance)
+
+    return instance
 
 
 try:
     from pyrogram import Client
+except ImportError:
+    Client = None
 
+if Client is not None and not hasattr(Client, "ns"):
     Client.ns = ns
-except Exception:
-    pass
