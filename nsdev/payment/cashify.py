@@ -29,7 +29,7 @@ class PaymentCashify:
         *,
         timeout: float = 30.0,
         max_retries: int = 3,
-        base_url: str = "https://cashify.my.id/api",
+        base_url: str = "https://api.casaku.id/api",
         qr_generator_url: str = "https://larabert-qrgen.hf.space/v1/create-qr-code",
         package_ids: Optional[List[str]] = None,
     ):
