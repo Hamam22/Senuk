@@ -4,7 +4,7 @@ import io
 import json
 import re
 import time
-from typing import Optional, Tuple
+from typing import Optional
 
 import cloudscraper25 as cloudscraper
 from bs4 import BeautifulSoup
@@ -35,9 +35,7 @@ class SaweriaScraper(QrCodeGenerator):
     def close(self) -> None:
         if self._closed:
             return
-
         self._closed = True
-
         with contextlib.suppress(Exception):
             self.scraper.close()
 
@@ -49,12 +47,12 @@ class SaweriaScraper(QrCodeGenerator):
             raise RuntimeError("SaweriaScraper sudah ditutup.")
 
     async def get_user_id(self, username: str) -> Optional[str]:
-        if not username or not isinstance(username, str):
-            raise ValueError("Username harus berupa string dan tidak boleh kosong.")
+        username = str(username or "").strip().lstrip("@")
 
-        username = username.strip().lstrip("@")
+        if not username:
+            raise ValueError("Username Saweria tidak boleh kosong.")
 
-        def _sync_get_with_retries(retries: int = 3, delay: int = 5):
+        def request_user_id(retries: int = 3, delay: int = 5):
             self._ensure_open()
             url = f"{self.FRONTEND}/{username}"
 
@@ -65,21 +63,25 @@ class SaweriaScraper(QrCodeGenerator):
                         headers=self.HEADERS,
                         timeout=15,
                     ) as res:
-                        if res.status_code == 200:
-                            soup = BeautifulSoup(res.text, "html.parser")
-                            next_data = soup.find(id="__NEXT_DATA__")
+                        if res.status_code != 200:
+                            continue
 
-                            if next_data:
-                                data = json.loads(next_data.text)
-                                user_id = (
-                                    data.get("props", {})
-                                    .get("pageProps", {})
-                                    .get("data", {})
-                                    .get("id")
-                                )
+                        soup = BeautifulSoup(res.text, "html.parser")
+                        next_data = soup.find(id="__NEXT_DATA__")
 
-                                if user_id:
-                                    return user_id
+                        if not next_data:
+                            continue
+
+                        data = json.loads(next_data.text)
+                        user_id = (
+                            data.get("props", {})
+                            .get("pageProps", {})
+                            .get("data", {})
+                            .get("id")
+                        )
+
+                        if user_id:
+                            return str(user_id)
 
                 except Exception:
                     pass
@@ -90,7 +92,7 @@ class SaweriaScraper(QrCodeGenerator):
             return None
 
         async with self._lock:
-            return await asyncio.to_thread(_sync_get_with_retries)
+            return await asyncio.to_thread(request_user_id)
 
     async def create_payment(
         self,
@@ -100,26 +102,26 @@ class SaweriaScraper(QrCodeGenerator):
         email: str,
         message: str,
         creator_name: str = "nsdev",
-    ) -> Tuple[str, str, io.BytesIO, int]:
-        if amount < 1000:
-            raise ValueError("Jumlah minimum donasi adalah 1000")
+    ) -> dict:
+        if int(amount) < 1000:
+            raise ValueError("Jumlah minimum donasi adalah 1000.")
 
         payload = {
             "agree": True,
             "notUnderage": True,
-            "message": message,
+            "message": str(message),
             "amount": int(amount),
             "payment_type": "qris",
             "vote": "",
             "currency": "IDR",
             "customer_info": {
-                "first_name": name,
-                "email": email,
+                "first_name": str(name or "User"),
+                "email": str(email),
                 "phone": "",
             },
         }
 
-        def _sync_post():
+        def create():
             self._ensure_open()
 
             with self.scraper.post(
@@ -129,18 +131,46 @@ class SaweriaScraper(QrCodeGenerator):
                 timeout=15,
             ) as res:
                 if not res.ok:
-                    raise Exception(f"Gagal membuat pembayaran: {res.text}")
+                    raise RuntimeError(
+                        f"Gagal membuat pembayaran Saweria: "
+                        f"{res.status_code} {res.text[:300]}"
+                    )
 
-                return res.json()["data"]
+                body = res.json()
+                data = body.get("data")
+
+                if not isinstance(data, dict):
+                    raise RuntimeError(
+                        "Response Saweria tidak memiliki data pembayaran."
+                    )
+
+                return data
 
         async with self._lock:
-            data = await asyncio.to_thread(_sync_post)
+            data = await asyncio.to_thread(create)
 
-        qr_string = data["qr_string"]
-        transaction_id = data["id"]
-        amount_raw = int(data["amount_raw"])
+        qr_string = str(data.get("qr_string") or "").strip()
+        transaction_id = str(data.get("id") or "").strip()
+        amount_raw = int(data.get("amount_raw") or amount)
 
-        qr_image_bytes = await self.generate(
+        if not transaction_id:
+            raise RuntimeError(
+                "Saweria tidak mengembalikan transaction ID."
+            )
+
+        if not qr_string:
+            raise RuntimeError(
+                "Saweria tidak mengembalikan QR string."
+            )
+
+        qr_url = self.generate_stylish_qr(
+            qr_string,
+            size="700x700",
+            style=1,
+            color="000000",
+        )
+
+        qr_bytes = await self.generate(
             data=qr_string,
             use_dots=True,
             glow_background=False,
@@ -148,16 +178,33 @@ class SaweriaScraper(QrCodeGenerator):
             creator_text=f"Created by: {creator_name}",
         )
 
-        qr_image_stream = io.BytesIO(qr_image_bytes)
-        qr_image_stream.name = f"{transaction_id}.png"
+        qr_stream = io.BytesIO(qr_bytes)
+        qr_stream.name = f"{transaction_id}.png"
+        qr_stream.seek(0)
 
-        return qr_string, transaction_id, qr_image_stream, amount_raw
+        return {
+            "trx_id": transaction_id,
+            "transaction_id": transaction_id,
+            "qr_string": qr_string,
+            "qr_url": qr_url,
+            "qr_stream": qr_stream,
+            "amount": amount_raw,
+            "amount_raw": amount_raw,
+            "raw": data,
+        }
 
-    async def check_paid_status(self, transaction_id: str) -> bool:
+    async def check_paid_status(
+        self,
+        transaction_id: str,
+    ) -> bool:
+        transaction_id = str(transaction_id or "").strip()
+
         if not transaction_id:
-            raise ValueError("Transaction ID tidak boleh kosong.")
+            raise ValueError(
+                "Transaction ID tidak boleh kosong."
+            )
 
-        def _sync_get():
+        def check():
             self._ensure_open()
 
             with self.scraper.get(
@@ -166,16 +213,27 @@ class SaweriaScraper(QrCodeGenerator):
                 timeout=15,
             ) as res:
                 if not res.ok:
-                    raise Exception("Transaction ID not found")
+                    raise RuntimeError(
+                        f"Transaction ID tidak ditemukan: "
+                        f"{res.status_code}"
+                    )
 
-                data = res.json().get("data", {})
-                return data.get("qr_string") == ""
+                data = res.json().get("data") or {}
+                return str(data.get("qr_string") or "") == ""
 
         async with self._lock:
-            return bool(await asyncio.to_thread(_sync_get))
+            return bool(
+                await asyncio.to_thread(check)
+            )
 
-    def get_amount(self, qr_text: str):
-        match = re.search(r"54(\d{2})(\d+)", qr_text or "")
+    def get_amount(
+        self,
+        qr_text: str,
+    ) -> Optional[int]:
+        match = re.search(
+            r"54(\d{2})(\d+)",
+            str(qr_text or ""),
+        )
 
         if not match:
             return None
